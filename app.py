@@ -54,6 +54,7 @@ class CheckResult:
     status: str = "UNKNOWN"          # OK | WARNING | CRITICAL | UNKNOWN
     metrics: dict = field(default_factory=dict)
     issues: list = field(default_factory=list)
+    fixes: list = field(default_factory=list)   # actionable suggestions
 
 
 def _fmt_bytes(b: float) -> str:
@@ -95,6 +96,14 @@ class SystemDiagnostics:
         if usage > 80:
             r.issues.append(f"High CPU usage: {usage:.1f}% (threshold: 80%)")
             r.status = "CRITICAL" if usage > 90 else "WARNING"
+            r.fixes.append(
+                "Open Task Manager (Ctrl+Shift+Esc) → Processes tab → sort by CPU → "
+                "right-click and End Task on anything you don't need."
+            )
+            r.fixes.append(
+                "Check Startup apps: Settings → Apps → Startup — disable anything "
+                "you don't need running at login."
+            )
 
         # Temperature
         try:
@@ -117,6 +126,11 @@ class SystemDiagnostics:
                         r.issues.append(f"High CPU temperature: {cpu_temp:.1f}°C (threshold: 85°C)")
                         if r.status != "CRITICAL":
                             r.status = "CRITICAL" if cpu_temp > 95 else "WARNING"
+                        r.fixes.append(
+                            "Clean dust from your CPU cooler and case vents with compressed air. "
+                            "Ensure all case fans are spinning. If the problem persists, "
+                            "consider reapplying thermal paste between the CPU and heatsink."
+                        )
                 else:
                     r.metrics["Temperature"] = "N/A"
             else:
@@ -129,25 +143,48 @@ class SystemDiagnostics:
     # ── Memory ───────────────────────────────────────────────────────
     def check_memory(self) -> CheckResult:
         r = CheckResult("Memory", "OK")
-        ram  = psutil.virtual_memory()
-        swap = psutil.swap_memory()
 
-        r.metrics["Total RAM"]  = _fmt_bytes(ram.total)
-        r.metrics["Used RAM"]   = _fmt_bytes(ram.used)
-        r.metrics["Available"]  = _fmt_bytes(ram.available)
-        r.metrics["RAM Usage"]  = f"{ram.percent:.1f}%"
-        r.metrics["Total Swap"] = _fmt_bytes(swap.total)
-        r.metrics["Swap Used"]  = _fmt_bytes(swap.used)
-        r.metrics["Swap Usage"] = f"{swap.percent:.1f}%"
+        try:
+            ram = psutil.virtual_memory()
+            r.metrics["Total RAM"]  = _fmt_bytes(ram.total)
+            r.metrics["Used RAM"]   = _fmt_bytes(ram.used)
+            r.metrics["Available"]  = _fmt_bytes(ram.available)
+            r.metrics["RAM Usage"]  = f"{ram.percent:.1f}%"
 
-        if ram.percent > 85:
-            r.issues.append(f"High RAM usage: {ram.percent:.1f}% (threshold: 85%)")
-            r.status = "CRITICAL" if ram.percent > 95 else "WARNING"
+            if ram.percent > 85:
+                r.issues.append(f"High RAM usage: {ram.percent:.1f}% (threshold: 85%)")
+                r.status = "CRITICAL" if ram.percent > 95 else "WARNING"
+                r.fixes.append(
+                    "Close unused browser tabs and applications. "
+                    "Open Task Manager (Ctrl+Shift+Esc) → Memory column to find "
+                    "the biggest consumers and close or restart them."
+                )
+                r.fixes.append(
+                    "Disable memory-heavy startup programs: "
+                    "Settings → Apps → Startup, or Task Manager → Startup Apps tab."
+                )
+        except Exception as e:
+            r.metrics["RAM"] = f"Read error: {e}"
+            r.status = "UNKNOWN"
 
-        if swap.total > 0 and swap.percent > 50:
-            r.issues.append(f"High swap usage: {swap.percent:.1f}% (threshold: 50%)")
-            if r.status == "OK":
-                r.status = "WARNING"
+        try:
+            swap = psutil.swap_memory()
+            r.metrics["Total Swap"] = _fmt_bytes(swap.total)
+            r.metrics["Swap Used"]  = _fmt_bytes(swap.used)
+            r.metrics["Swap Usage"] = f"{swap.percent:.1f}%"
+
+            if swap.total > 0 and swap.percent > 50:
+                r.issues.append(f"High swap/page-file usage: {swap.percent:.1f}% (threshold: 50%)")
+                if r.status == "OK":
+                    r.status = "WARNING"
+                r.fixes.append(
+                    "Windows: increase your page file — "
+                    "Search 'Adjust the appearance and performance of Windows' → Advanced → "
+                    "Virtual Memory → Change → set a larger custom size. "
+                    "Long-term fix: install more physical RAM."
+                )
+        except Exception as e:
+            r.metrics["Swap"] = f"Read error: {e}"
 
         return r
 
@@ -169,6 +206,12 @@ class SystemDiagnostics:
                     )
                     if r.status == "OK":
                         r.status = "CRITICAL" if u.percent > 95 else "WARNING"
+                    r.fixes.append(
+                        f"Free space on {part.device}: "
+                        "run Disk Cleanup (Win+R → cleanmgr), "
+                        "empty the Recycle Bin, delete files in C:\\Windows\\Temp, "
+                        "and go to Settings → Apps to uninstall programs you no longer use."
+                    )
             except (PermissionError, OSError):
                 r.metrics[part.device] = "Permission denied"
 
@@ -188,6 +231,11 @@ class SystemDiagnostics:
                             if "FAILED" in health.stdout:
                                 r.issues.append(f"SMART failure on {dev}")
                                 r.status = "CRITICAL"
+                                r.fixes.append(
+                                    f"SMART failure on {dev}: back up all important files "
+                                    "immediately — drive failure may be imminent. "
+                                    "Plan to replace this drive as soon as possible."
+                                )
                             elif "PASSED" in health.stdout:
                                 r.metrics[f"SMART {dev}"] = "PASSED"
                         except Exception:
@@ -229,17 +277,32 @@ class SystemDiagnostics:
                     )
                     if r.status == "OK":
                         r.status = "WARNING"
+                    r.fixes.append(
+                        f"Network errors on {iface}: update your network adapter driver "
+                        "via Device Manager → Network Adapters → right-click → Update driver. "
+                        "Also try a different Ethernet cable, or switch WiFi bands (2.4 GHz ↔ 5 GHz)."
+                    )
                 if io.dropin or io.dropout:
                     r.issues.append(
                         f"{iface}: {io.dropin} inbound / {io.dropout} outbound drops"
                     )
                     if r.status == "OK":
                         r.status = "WARNING"
+                    r.fixes.append(
+                        f"Packet drops on {iface}: move closer to your router, "
+                        "use a wired Ethernet connection if possible, "
+                        "or reduce interference by switching WiFi channels in your router settings."
+                    )
 
         r.metrics["Active Interfaces"] = str(active)
         if active == 0:
             r.issues.append("No active IPv4 interfaces detected")
             r.status = "WARNING"
+            r.fixes.append(
+                "Check that your network cable is plugged in or WiFi is enabled. "
+                "In Windows: Settings → Network & Internet → check adapter status. "
+                "Try: ipconfig /release  then  ipconfig /renew  in Command Prompt."
+            )
 
         return r
 
@@ -293,6 +356,10 @@ class SystemDiagnostics:
         if zombie > 0:
             r.issues.append(f"{zombie} zombie process(es) found")
             r.status = "WARNING"
+            r.fixes.append(
+                "Zombie processes are harmless remnants of crashed apps. "
+                "Restart the application that created them, or reboot your computer to clear them."
+            )
 
         return r
 
@@ -328,6 +395,11 @@ class SystemDiagnostics:
                 if failed:
                     r.issues.append(f"{len(failed)} failed systemd service(s)")
                     r.status = "WARNING"
+                    r.fixes.append(
+                        "Check which services failed: run  systemctl --failed  "
+                        "then restart each one with  sudo systemctl restart <service-name>  "
+                        "and view logs with  journalctl -xe"
+                    )
             except Exception:
                 r.metrics["Failed Services"] = "Unknown"
 
@@ -367,6 +439,11 @@ class SystemDiagnostics:
                             r.issues.append(f"{len(pkgs)} pending OS updates")
                             if r.status == "OK":
                                 r.status = "WARNING"
+                            r.fixes.append(
+                                f"Install {len(pkgs)} pending updates by running: "
+                                "sudo apt upgrade   (or  sudo dnf upgrade  /  sudo yum upgrade  "
+                                "depending on your distro)."
+                            )
                     except Exception:
                         r.metrics["Pending Updates"] = "Unknown"
                     break
@@ -385,11 +462,19 @@ class SystemDiagnostics:
                         r.issues.append(f"{len(updates)} macOS update(s) available")
                         if r.status == "OK":
                             r.status = "WARNING"
+                        r.fixes.append(
+                            "Install macOS updates: open System Settings → General → "
+                            "Software Update and click 'Update Now'."
+                        )
             except Exception:
                 r.metrics["Pending Updates"] = "Unknown"
 
         elif system == "Windows":
-            r.metrics["Pending Updates"] = "Check Windows Update manually"
+            r.metrics["Pending Updates"] = "See Windows Update"
+            r.fixes.append(
+                "Check for Windows updates: Settings → Windows Update → Check for updates. "
+                "Keep Windows updated to get security patches and bug fixes."
+            )
 
         return r
 
@@ -442,12 +527,15 @@ class DiagnosticCard(ctk.CTkFrame):
             fill="x", padx=14, pady=(2, 6)
         )
 
-        # ── metrics & issues containers ──────────────────────────────
+        # ── metrics, issues, fixes containers ───────────────────────
         self._metrics_box = ctk.CTkFrame(self, fg_color="transparent")
         self._metrics_box.pack(fill="x", padx=14)
 
         self._issues_box = ctk.CTkFrame(self, fg_color="transparent")
-        self._issues_box.pack(fill="x", padx=14, pady=(4, 12))
+        self._issues_box.pack(fill="x", padx=14, pady=(4, 2))
+
+        self._fixes_box = ctk.CTkFrame(self, fg_color="transparent")
+        self._fixes_box.pack(fill="x", padx=14, pady=(0, 12))
 
         # spacer at bottom so empty cards don't collapse completely
         self._placeholder = ctk.CTkLabel(
@@ -467,6 +555,7 @@ class DiagnosticCard(ctk.CTkFrame):
 
         self._clear(self._metrics_box)
         self._clear(self._issues_box)
+        self._clear(self._fixes_box)
 
         # metrics
         for key, value in result.metrics.items():
@@ -496,6 +585,32 @@ class DiagnosticCard(ctk.CTkFrame):
                 justify="left",
             ).pack(fill="x", padx=6, pady=4)
 
+        # fixes
+        if result.fixes:
+            ctk.CTkLabel(
+                self._fixes_box,
+                text="  Suggested Fixes",
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color=("#4a90d9", "#4fc3f7"),
+                anchor="w",
+            ).pack(fill="x", pady=(4, 2))
+            for fix in result.fixes:
+                fix_bubble = ctk.CTkFrame(
+                    self._fixes_box,
+                    fg_color=("#e8f4fd", "#0d2137"),
+                    corner_radius=6,
+                )
+                fix_bubble.pack(fill="x", pady=2)
+                ctk.CTkLabel(
+                    fix_bubble,
+                    text=f"  →  {fix}",
+                    font=ctk.CTkFont(size=11),
+                    text_color=("#1a5f99", "#4fc3f7"),
+                    anchor="w",
+                    wraplength=360,
+                    justify="left",
+                ).pack(fill="x", padx=6, pady=5)
+
     def reset(self) -> None:
         self._dot.configure(text_color="#95a5a6")
         self._badge.configure(
@@ -505,6 +620,7 @@ class DiagnosticCard(ctk.CTkFrame):
         )
         self._clear(self._metrics_box)
         self._clear(self._issues_box)
+        self._clear(self._fixes_box)
         self._placeholder = ctk.CTkLabel(
             self._metrics_box, text="Running check…",
             font=ctk.CTkFont(size=11), text_color=("#aaaaaa", "#555555"),
@@ -770,6 +886,10 @@ class App(ctk.CTk):
                 lines.append("    Issues:")
                 for issue in r.issues:
                     lines.append(f"      !  {issue}")
+            if r.fixes:
+                lines.append("    Suggested Fixes:")
+                for fix in r.fixes:
+                    lines.append(f"      →  {fix}")
             lines.append("")
 
         lines += ["=" * 62, "  END OF REPORT", "=" * 62]
