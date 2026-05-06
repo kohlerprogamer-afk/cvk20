@@ -1,6 +1,8 @@
 import express from 'express';
 import cors from 'cors';
-import Anthropic from '@anthropic-ai/sdk';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { google } from 'googleapis';
+import { XMLParser } from 'fast-xml-parser';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -12,172 +14,259 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// St. Louis, MO coordinates
 const STL_LAT = 38.627;
 const STL_LON = -90.1994;
 
-app.get('/api/weather', async (req, res) => {
-  try {
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${STL_LAT}&longitude=${STL_LON}&current=temperature_2m,apparent_temperature,weathercode,windspeed_10m,precipitation&daily=temperature_2m_max,temperature_2m_min,weathercode&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=America%2FChicago&forecast_days=1`;
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Weather API error: ${response.status}`);
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    console.error('Weather fetch error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
+// ── Data fetchers ────────────────────────────────────────────────────────────
 
-function describeWeatherCode(code) {
-  const codes = {
+async function fetchWeather() {
+  const url =
+    `https://api.open-meteo.com/v1/forecast` +
+    `?latitude=${STL_LAT}&longitude=${STL_LON}` +
+    `&current=temperature_2m,apparent_temperature,weathercode,windspeed_10m,precipitation` +
+    `&daily=temperature_2m_max,temperature_2m_min,weathercode` +
+    `&temperature_unit=fahrenheit&windspeed_unit=mph` +
+    `&timezone=America%2FChicago&forecast_days=1`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Weather API ${res.status}`);
+  return res.json();
+}
+
+function weatherCodeDesc(code) {
+  const map = {
     0: 'Clear sky', 1: 'Mainly clear', 2: 'Partly cloudy', 3: 'Overcast',
-    45: 'Foggy', 48: 'Icy fog',
+    45: 'Fog', 48: 'Icy fog',
     51: 'Light drizzle', 53: 'Drizzle', 55: 'Heavy drizzle',
     61: 'Light rain', 63: 'Rain', 65: 'Heavy rain',
     71: 'Light snow', 73: 'Snow', 75: 'Heavy snow', 77: 'Snow grains',
     80: 'Light showers', 81: 'Showers', 82: 'Heavy showers',
-    85: 'Snow showers', 86: 'Heavy snow showers',
-    95: 'Thunderstorm', 96: 'Thunderstorm with hail', 99: 'Thunderstorm with heavy hail',
+    95: 'Thunderstorm', 96: 'Thunderstorm with hail', 99: 'Heavy thunderstorm',
   };
-  return codes[code] ?? 'Unknown';
+  return map[code] ?? 'Unknown conditions';
 }
 
-app.post('/api/generate', async (req, res) => {
-  const { topic = 'St. Louis Cardinals', weatherData } = req.body;
+async function fetchGmailEmails(token) {
+  if (!token) return null;
+  const auth = new google.auth.OAuth2();
+  auth.setCredentials({ access_token: token });
+  const gmail = google.gmail({ version: 'v1', auth });
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not set.' });
+  const list = await gmail.users.messages.list({
+    userId: 'me',
+    q: 'is:unread',
+    maxResults: 5,
+  });
+
+  if (!list.data.messages?.length) return [];
+
+  const messages = await Promise.all(
+    list.data.messages.map(m =>
+      gmail.users.messages.get({
+        userId: 'me',
+        id: m.id,
+        format: 'metadata',
+        metadataHeaders: ['Subject', 'From'],
+      })
+    )
+  );
+
+  return messages.map(m => {
+    const headers = m.data.payload?.headers ?? [];
+    const h = name => headers.find(x => x.name === name)?.value ?? '';
+    return { subject: h('Subject'), from: h('From'), snippet: m.data.snippet ?? '' };
+  });
+}
+
+async function fetchCalendarEvents(token) {
+  if (!token) return null;
+  const auth = new google.auth.OAuth2();
+  auth.setCredentials({ access_token: token });
+  const cal = google.calendar({ version: 'v3', auth });
+
+  const now = new Date();
+  const tz = 'America/Chicago';
+  const startOfDay = new Date(now.toLocaleDateString('en-CA', { timeZone: tz })).toISOString();
+  const endOfDay = new Date(
+    new Date(startOfDay).getTime() + 86400000 - 1
+  ).toISOString();
+
+  const res = await cal.events.list({
+    calendarId: 'primary',
+    timeMin: startOfDay,
+    timeMax: endOfDay,
+    singleEvents: true,
+    orderBy: 'startTime',
+    timeZone: tz,
+  });
+
+  return (res.data.items ?? []).map(e => ({
+    title: e.summary ?? 'Untitled',
+    start: e.start?.dateTime ?? e.start?.date ?? '',
+    end: e.end?.dateTime ?? e.end?.date ?? '',
+    location: e.location ?? '',
+  }));
+}
+
+async function fetchNewsRSS(topic) {
+  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(topic)}&hl=en-US&gl=US&ceid=US:en`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  if (!res.ok) throw new Error(`News RSS ${res.status}`);
+  const xml = await res.text();
+  const parser = new XMLParser({ ignoreAttributes: false });
+  const doc = parser.parse(xml);
+  const items = doc?.rss?.channel?.item ?? [];
+  const arr = Array.isArray(items) ? items : [items];
+  return arr.slice(0, 8).map(i => ({
+    title: typeof i.title === 'string' ? i.title : (i.title?.['#text'] ?? ''),
+    description: typeof i.description === 'string' ? i.description : '',
+  }));
+}
+
+// ── Routes ───────────────────────────────────────────────────────────────────
+
+app.get('/api/weather', async (_req, res) => {
+  try {
+    res.json(await fetchWeather());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/generate', async (req, res) => {
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY is not set.' });
   }
 
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const { topic = 'St. Louis Cardinals', weatherData } = req.body;
 
   const today = new Date().toLocaleDateString('en-US', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     timeZone: 'America/Chicago',
   });
 
+  // Parallel data fetching
+  const gmailToken = process.env.GMAIL_TOKEN;
+  const calendarToken = process.env.CALENDAR_TOKEN || process.env.GMAIL_TOKEN;
+
+  const [emails, events, newsItems] = await Promise.allSettled([
+    fetchGmailEmails(gmailToken),
+    fetchCalendarEvents(calendarToken),
+    fetchNewsRSS(topic),
+  ]);
+
+  const emailData = emails.status === 'fulfilled' ? emails.value : null;
+  const eventData = events.status === 'fulfilled' ? events.value : null;
+  const newsData = newsItems.status === 'fulfilled' ? newsItems.value : [];
+
+  if (emails.status === 'rejected') console.error('Gmail error:', emails.reason.message);
+  if (events.status === 'rejected') console.error('Calendar error:', events.reason.message);
+  if (newsItems.status === 'rejected') console.error('News error:', newsItems.reason.message);
+
+  // Build weather context from pre-fetched data
   let weatherContext = 'Weather data unavailable.';
   if (weatherData?.current) {
     const c = weatherData.current;
     const d = weatherData.daily;
-    const condition = describeWeatherCode(c.weathercode);
-    weatherContext = `${condition}, ${c.temperature_2m}°F (feels like ${c.apparent_temperature}°F), wind ${c.windspeed_10m} mph. High: ${d?.temperature_2m_max?.[0]}°F, Low: ${d?.temperature_2m_min?.[0]}°F.`;
+    weatherContext =
+      `${weatherCodeDesc(c.weathercode)}, ${c.temperature_2m}°F ` +
+      `(feels like ${c.apparent_temperature}°F), wind ${c.windspeed_10m} mph. ` +
+      `High: ${d?.temperature_2m_max?.[0]}°F, Low: ${d?.temperature_2m_min?.[0]}°F.`;
   }
 
-  const gmailToken = process.env.GMAIL_TOKEN;
-  const calendarToken = process.env.CALENDAR_TOKEN || process.env.GMAIL_TOKEN;
+  // Format data for prompt
+  const emailSection = emailData === null
+    ? 'Gmail not connected (GMAIL_TOKEN not set).'
+    : emailData.length === 0
+      ? 'No unread emails.'
+      : emailData.map((e, i) =>
+          `${i + 1}. From: ${e.from}\n   Subject: ${e.subject}\n   Preview: ${e.snippet}`
+        ).join('\n');
 
-  const mcpServers = [];
-  if (gmailToken) {
-    mcpServers.push({
-      type: 'url',
-      url: 'https://gmailmcp.googleapis.com/mcp/v1',
-      name: 'gmail',
-      authorization_token: gmailToken,
-    });
-  }
-  if (calendarToken) {
-    mcpServers.push({
-      type: 'url',
-      url: 'https://calendarmcp.googleapis.com/mcp/v1',
-      name: 'gcalendar',
-      authorization_token: calendarToken,
-    });
-  }
+  const calendarSection = eventData === null
+    ? 'Google Calendar not connected (GMAIL_TOKEN not set).'
+    : eventData.length === 0
+      ? 'No events today.'
+      : eventData.map(e => {
+          const start = e.start ? new Date(e.start).toLocaleTimeString('en-US', {
+            hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago',
+          }) : '';
+          return `- ${start ? start + ' — ' : ''}${e.title}${e.location ? ' @ ' + e.location : ''}`;
+        }).join('\n');
 
-  const hasGmail = mcpServers.some(s => s.name === 'gmail');
-  const hasCalendar = mcpServers.some(s => s.name === 'gcalendar');
+  const newsSection = newsData.length === 0
+    ? 'No news found.'
+    : newsData.map((n, i) => `${i + 1}. ${n.title}`).join('\n');
 
-  const systemPrompt = `You are a morning brief assistant. Today is ${today}. Your job is to compile a concise, useful morning briefing using the tools available to you.
+  const prompt = `Today is ${today}. You are writing a concise morning brief. Use the data below and return ONLY a valid JSON object — no markdown fences, no extra text.
 
-After gathering all information, respond with ONLY a valid JSON object — no markdown fences, no extra text — using this exact structure:
+=== WEATHER (St. Louis, MO) ===
+${weatherContext}
+
+=== TODAY'S CALENDAR EVENTS ===
+${calendarSection}
+
+=== UNREAD EMAILS (5 most recent) ===
+${emailSection}
+
+=== NEWS HEADLINES (topic: "${topic}") ===
+${newsSection}
+
+Return this exact JSON structure:
 {
   "greeting": "Good morning! Today is ${today}.",
   "weather": {
     "summary": "One-sentence weather summary",
-    "current": "Current temp and feels-like",
-    "high": "Today's high",
-    "low": "Today's low",
-    "wind": "Wind description"
+    "current": "Current temp and feels-like e.g. 72°F (feels like 69°F)",
+    "high": "e.g. 80°F",
+    "low": "e.g. 60°F",
+    "wind": "e.g. 12 mph"
   },
   "schedule": [
-    { "time": "9:00 AM", "title": "Event title", "description": "Optional details or empty string" }
+    { "time": "9:00 AM", "title": "Event title", "description": "" }
   ],
   "emails": [
-    { "subject": "Subject line", "from": "Sender name or email", "summary": "What this is about and any action needed", "urgent": false }
+    { "subject": "Subject", "from": "Sender", "summary": "What it's about and any action needed", "urgent": false }
   ],
   "news": [
-    "Bullet point 1",
-    "Bullet point 2",
-    "Bullet point 3"
+    "Concise bullet point summarizing headline 1",
+    "Concise bullet point summarizing headline 2",
+    "Concise bullet point summarizing headline 3"
   ],
   "newsTopic": "${topic}"
 }
 
 Rules:
-- schedule: if no calendar access or no events, use [{ "time": "", "title": "No events today", "description": "" }]
-- emails: if no Gmail access, use [{ "subject": "Gmail not connected", "from": "System", "summary": "Set GMAIL_TOKEN in .env to enable email summaries.", "urgent": false }]
-- news: always provide 3-5 bullet points from your web search
+- schedule: if no events, use [{ "time": "", "title": "No events today", "description": "" }]
+- emails: if not connected, use [{ "subject": "Gmail not connected", "from": "System", "summary": "Set GMAIL_TOKEN in .env to enable.", "urgent": false }]
+- news: provide 3-5 bullet points synthesizing the headlines above
+- urgent: true only if the email looks time-sensitive or action-required
 - Respond with ONLY the JSON object.`;
 
-  const userMessage = `Please create my morning brief for today (${today}).
-
-Weather in St. Louis, MO: ${weatherContext}
-
-${hasCalendar ? "Use your Google Calendar MCP tool to list today's events." : 'Google Calendar is not connected.'}
-
-${hasGmail ? 'Use your Gmail MCP tool to find the 5 most recent unread emails. Summarize each briefly.' : 'Gmail is not connected.'}
-
-Use the web_search tool to find the latest news about: "${topic}". Summarize in 3-5 bullet points.
-
-Return the complete brief as the JSON structure specified.`;
-
   try {
-    const betas = ['web-search-2025-03-05'];
-    if (mcpServers.length > 0) betas.push('mcp-client-2025-04-04');
-
-    const requestParams = {
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4096,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userMessage }],
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-    };
-
-    if (mcpServers.length > 0) {
-      requestParams.mcp_servers = mcpServers;
-    }
-
-    const response = await client.beta.messages.create({
-      ...requestParams,
-      betas,
+    const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genai.getGenerativeModel({
+      model: 'gemini-2.0-flash',
+      generationConfig: { responseMimeType: 'application/json' },
     });
-
-    const textContent = response.content.find(c => c.type === 'text');
-    if (!textContent) throw new Error('No text in API response.');
+    const result = await model.generateContent(prompt);
+    const text = result.response.text().trim();
 
     let brief;
     try {
-      const raw = textContent.text.trim();
-      const jsonStr = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
-      brief = JSON.parse(jsonStr);
+      brief = JSON.parse(text);
     } catch {
-      brief = { raw: textContent.text };
+      brief = { raw: text };
     }
 
     res.json({ brief });
   } catch (err) {
-    console.error('Anthropic API error:', err);
+    console.error('Gemini error:', err);
     res.status(500).json({ error: err.message || 'Failed to generate brief.' });
   }
 });
 
-// Serve built frontend in production
 app.use(express.static(join(__dirname, 'dist')));
-app.get('*', (_req, res) => {
-  res.sendFile(join(__dirname, 'dist', 'index.html'));
-});
+app.get('*', (_req, res) => res.sendFile(join(__dirname, 'dist', 'index.html')));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
