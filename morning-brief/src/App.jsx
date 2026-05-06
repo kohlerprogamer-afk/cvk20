@@ -5,11 +5,9 @@ import EmailsCard from './components/EmailsCard.jsx';
 import NewsCard from './components/NewsCard.jsx';
 
 const STAGES = [
-  'Fetching weather data...',
-  'Connecting to AI...',
-  'Checking calendar & email...',
-  'Searching latest news...',
-  'Compiling your brief...',
+  'Fetching weather...',
+  'Fetching news...',
+  'Building your brief...',
 ];
 
 export default function App() {
